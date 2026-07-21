@@ -133,16 +133,60 @@ export async function runPrompt(
   let tick = 0;
   let promptSent = false;
   let hasSessionError = false;
+  // Mitigation for Discord REST timeouts under sustained streaming:
+  // discord.js's SequentialHandler queues edits on the same bucket, and
+  // undici's default connectTimeout is 10s. If a single edit stalls
+  // (Cloudflare keep-alive drop, transient network blip, etc.) every
+  // subsequent 1Hz tick piles another request into the queue and they all
+  // timeout in cascade, leaving the stream message frozen.
+  //   1. We skip interval ticks while an edit is still in flight, so the
+  //      SequentialHandler queue cannot grow unbounded.
+  //   2. We race each edit against an explicit 8s timeout so a stuck edit
+  //      fails fast and the next tick can try again with a fresh connection
+  //      instead of waiting for undici's 10s default.
+  const STREAM_EDIT_TIMEOUT_MS = 8000;
+  let streamEditInFlight = false;
   const spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-  
+
   const updateStreamMessage = async (body: string, components: ActionRowBuilder<ButtonBuilder>[]): Promise<boolean> => {
+    if (streamEditInFlight) {
+      // Another edit is still pending in discord.js's queue — drop this tick.
+      // The in-flight edit will complete (or fail fast via the timeout) and
+      // the next tick will retry with fresh content.
+      return false;
+    }
+    streamEditInFlight = true;
+    let timeoutHandle: NodeJS.Timeout | null = null;
     try {
       const { prefixBody, overflowChunks } = splitForDiscordTemplate({
         header: contextHeader,
         prompt,
         body,
       });
-      await streamMessage.edit({ content: prefixBody, components });
+      // Race the edit against a hard timeout so a stuck REST request can't
+      // hold streamEditInFlight forever. discord.js's edit() does not
+      // natively accept AbortSignal, so we race against a timeout that
+      // rejects if the edit hangs longer than STREAM_EDIT_TIMEOUT_MS.
+      let timedOut = false;
+      const editPromise = streamMessage.edit({ content: prefixBody, components });
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          timedOut = true;
+          reject(new Error(`stream edit timed out after ${STREAM_EDIT_TIMEOUT_MS}ms`));
+        }, STREAM_EDIT_TIMEOUT_MS);
+      });
+      try {
+        await Promise.race([editPromise, timeoutPromise]);
+      } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+      }
+      if (timedOut) {
+        // The underlying REST request is still pending in discord.js's queue
+        // and will eventually resolve/reject on its own; we just stop waiting
+        // so the next interval tick can proceed.
+        console.error(`stream edit exceeded ${STREAM_EDIT_TIMEOUT_MS}ms; abandoning wait and continuing`);
+        return false;
+      }
       for (const chunk of overflowChunks) {
         try {
           await (channel as any).send({ content: chunk });
@@ -154,6 +198,8 @@ export async function runPrompt(
     } catch (error) {
       console.error('Failed to edit stream message:', error instanceof Error ? error.message : error);
       return false;
+    } finally {
+      streamEditInFlight = false;
     }
   };
 
